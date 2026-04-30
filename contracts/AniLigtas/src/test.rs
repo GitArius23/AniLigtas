@@ -2,7 +2,7 @@
 mod tests {
     use soroban_sdk::{
         testutils::{Address as _, Events},
-        token::{Client as TokenClient, StellarAssetClient},
+        token::{TokenClient, StellarAssetClient},
         Address, Bytes, Env, IntoVal,
     };
 
@@ -18,12 +18,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Helper: deploy contract + USDC mock token; fund the pool; return handles
+    // Helper: deploy contract + mock USDC token, seed the pool, return handles
     // -----------------------------------------------------------------------
     fn setup() -> (
         Env,
         AniLigtasContractClient<'static>,
-        Address, // token contract (mock USDC)
+        Address, // mock token contract (USDC)
         Address, // admin
         Address, // farmer wallet
     ) {
@@ -33,25 +33,24 @@ mod tests {
         let admin = Address::generate(&env);
         let farmer_wallet = Address::generate(&env);
 
-        // Deploy the AniLigtas contract
+        // Deploy AniLigtas contract
         let contract_id = env.register_contract(None, AniLigtasContract);
         let client = AniLigtasContractClient::new(&env, &contract_id);
         client.initialize(&admin);
 
-        // Create a mock Stellar asset to represent USDC
-        let token_id = env.register_stellar_asset_contract(admin.clone());
-        let asset_admin = StellarAssetClient::new(&env, &token_id);
+        // register_stellar_asset_contract_v2 is the correct call in SDK v20/v21
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let asset_admin = StellarAssetClient::new(&env, &token_id.address());
 
-        // Mint USDC to both the admin (for pool seeding) and the contract itself
-        asset_admin.mint(&admin, &1_000_000_000_i128); // $10,000 USDC (6 decimals)
+        // Mint $10,000 USDC (7 decimals, but we treat as 6 here for simplicity)
+        asset_admin.mint(&admin, &1_000_000_000_i128);
 
-        (env, client, token_id, admin, farmer_wallet)
+        (env, client, token_id.address(), admin, farmer_wallet)
     }
 
     // -----------------------------------------------------------------------
     // Test 1 — Happy path
-    // A farmer files a claim, the admin approves it, and USDC lands in the
-    // farmer's wallet from the community pool.
+    // Farmer files claim → admin approves → USDC lands in farmer wallet
     // -----------------------------------------------------------------------
     #[test]
     fn test_happy_path_claim_and_disburse() {
@@ -62,30 +61,29 @@ mod tests {
         let claim_id  = make_bytes(&env, 20);
         let evidence  = make_bytes(&env, 30);
 
-        // Fund the community pool with $500 USDC
+        // Seed pool with $500 USDC
         let pool_deposit: i128 = 500_000_000;
         client.deposit_to_pool(&token_id, &admin, &pool_deposit);
         assert_eq!(client.get_pool_balance(), pool_deposit);
 
-        // Register the farmer
+        // Register farmer
         client.register_farmer(&farmer_id, &farmer_wallet, &coop_id);
 
-        // Farmer files a crop-loss claim for $200 USDC
-        let loss: i128 = 200_000_000;
-        client.file_claim(&farmer_id, &claim_id, &loss, &evidence);
+        // Farmer files a $200 loss claim
+        client.file_claim(&farmer_id, &claim_id, &200_000_000_i128, &evidence);
 
-        // Admin approves and disburses $150 USDC (partial, reflecting assessed damage)
+        // Admin approves $150 payout
         let payout: i128 = 150_000_000;
         client.approve_and_disburse(&claim_id, &payout, &token_id);
 
-        // Farmer wallet must now hold the payout
+        // Farmer wallet must hold exactly the payout amount
         let token = TokenClient::new(&env, &token_id);
         assert_eq!(token.balance(&farmer_wallet), payout);
 
-        // Pool balance must have decreased by the payout
+        // Pool must be debited correctly
         assert_eq!(client.get_pool_balance(), pool_deposit - payout);
 
-        // Claim status must be Approved (1)
+        // Claim must be marked Approved (status = 1)
         let claim = client.get_claim(&claim_id);
         assert_eq!(claim.status, 1);
         assert_eq!(claim.approved_amount, payout);
@@ -93,8 +91,8 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Test 2 — Edge case
-    // A farmer cannot file two claims simultaneously; the second attempt must
-    // return Error::ActiveClaimExists.
+    // A farmer cannot file two simultaneous claims; second attempt must return
+    // Error::ActiveClaimExists
     // -----------------------------------------------------------------------
     #[test]
     fn test_duplicate_active_claim_rejected() {
@@ -112,7 +110,7 @@ mod tests {
         // First claim succeeds
         client.file_claim(&farmer_id, &claim_id_a, &100_000_000_i128, &evidence);
 
-        // Second claim while first is still pending must fail
+        // Second claim while first is pending must fail
         let result = client.try_file_claim(
             &farmer_id,
             &claim_id_b,
@@ -120,16 +118,18 @@ mod tests {
             &evidence,
         );
         assert!(result.is_err());
+
+        // Confirm it's specifically the ActiveClaimExists error
         let sdk_err = result.unwrap_err().unwrap();
         assert_eq!(sdk_err, Error::ActiveClaimExists.into_val(&env));
     }
 
     // -----------------------------------------------------------------------
     // Test 3 — State verification
-    // After a successful claim filing, contract storage must correctly reflect:
-    //   • The claim record with status Pending (0) and correct loss amount
-    //   • The farmer record with has_active_claim = true
-    //   • At least one on-chain event was emitted
+    // After filing a claim, contract storage must show:
+    //   • ClaimRecord with status=0 (Pending) and correct loss_amount
+    //   • FarmerRecord with has_active_claim = true
+    //   • At least 3 on-chain events emitted (enroll, deposit, claim)
     // -----------------------------------------------------------------------
     #[test]
     fn test_state_after_claim_filing() {
@@ -139,24 +139,24 @@ mod tests {
         let coop_id   = make_bytes(&env, 12);
         let claim_id  = make_bytes(&env, 23);
         let evidence  = make_bytes(&env, 32);
-        let loss: i128 = 75_000_000; // $75 USDC
+        let loss: i128 = 75_000_000;
 
         client.deposit_to_pool(&token_id, &admin, &500_000_000_i128);
         client.register_farmer(&farmer_id, &farmer_wallet, &coop_id);
         client.file_claim(&farmer_id, &claim_id, &loss, &evidence);
 
-        // Claim record must show correct loss and Pending status
+        // Claim must be Pending with the correct loss amount
         let claim = client.get_claim(&claim_id);
-        assert_eq!(claim.status, 0);          // Pending
+        assert_eq!(claim.status, 0);
         assert_eq!(claim.loss_amount, loss);
-        assert_eq!(claim.approved_amount, 0); // Not yet approved
+        assert_eq!(claim.approved_amount, 0);
 
-        // Farmer record must flag an active claim
+        // Farmer must have active claim flagged
         let farmer = client.get_farmer(&farmer_id);
         assert!(farmer.has_active_claim);
         assert_eq!(farmer.wallet, farmer_wallet);
 
-        // At least the enrollment, deposit, and claim events should exist
+        // At least enroll + deposit + claim events must exist
         let events = env.events().all();
         assert!(events.len() >= 3);
     }

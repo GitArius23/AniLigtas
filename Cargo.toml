@@ -1,23 +1,31 @@
-[workspace]
-resolver = "2"
-members = [
-  "contracts/*",
-]
+[package]
+name = "ani_ligtas"
+version = "0.1.0"
+edition = "2021"
+description = "On-chain disaster relief fund and crop-loss claims for Filipino farming cooperatives on Stellar"
+license = "MIT"
 
-[workspace.dependencies]
-soroban-sdk = "25"
+[lib]
+crate-type = ["cdylib", "rlib"]
 
+[dependencies]
+soroban-sdk = { version = "20.0.0" }
+
+[dev-dependencies]
+soroban-sdk = { version = "20.0.0", features = ["testutils"] }
+
+# ---------------------------------------------------------------------------
+# Release profile — compact Wasm output required by Soroban
+# ---------------------------------------------------------------------------
 [profile.release]
-opt-level = "z"
+opt-level = "z"        # Optimise for binary size
 overflow-checks = true
-debug = 0
+debug = false
 strip = "symbols"
-debug-assertions = false
-panic = "abort"
-codegen-units = 1
 lto = true
+codegen-units = 1
+panic = "abort"        # No stack unwinding in Wasm
 
-# For more information about this profile see https://soroban.stellar.org/docs/basic-tutorials/logging#cargotoml-profile
 [profile.release-with-logs]
 inherits = "release"
-debug-assertions = true
+debug-assertions = true  # Enables soroban logging macros during debug builds
